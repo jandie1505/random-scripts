@@ -1,0 +1,35 @@
+#!/bin/bash
+#
+# serve-cert - emit one certificate bundle as a tar archive on stdout.
+#
+# Runs on the central ACME host as a forced command. The target is fixed in
+# authorized_keys, never supplied by the client:
+#
+#   command="/usr/local/bin/serve-cert proxy",restrict ssh-ed25519 AAAA...
+#
+# Usage: serve-cert <target>
+
+set -euo pipefail
+
+CERT_ROOT=${SERVE_CERT_ROOT:-/srv/certs}
+
+die() { echo "serve-cert: $*" >&2; exit 1; }
+
+target=${1:-}
+[ -n "$target" ] || die "no target given"
+
+# Reject anything that could escape CERT_ROOT. Guards against a typo in
+# authorized_keys, since the value is not attacker-controlled to begin with.
+case "$target" in
+    *[!a-zA-Z0-9._-]*) die "invalid target name" ;;
+    .|..)              die "invalid target name" ;;
+esac
+
+dir="$CERT_ROOT/$target"
+[ -d "$dir" ] || die "unknown target"
+
+for f in fullchain.pem privkey.pem; do
+    [ -r "$dir/$f" ] || die "$f missing or unreadable for target $target"
+done
+
+exec tar -C "$dir" -cf - fullchain.pem privkey.pem
