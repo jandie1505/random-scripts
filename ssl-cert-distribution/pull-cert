@@ -1,0 +1,286 @@
+#!/bin/bash
+#
+# pull-cert - fetch a TLS certificate from a central ACME host and install it
+#             locally, reloading the consuming service only when it changed.
+#
+# Usage: pull-cert <profile> [--dry-run] [--force] [--verbose]
+#
+# Reads /etc/pull-cert/<profile>.conf. See pull-cert.conf.example.
+#
+# The remote side is expected to answer an SSH connection with a tar archive
+# on stdout containing "fullchain.pem" and "privkey.pem" (see serve-cert).
+
+set -euo pipefail
+
+PROGNAME=$(basename "$0")
+CONFIG_DIR=${PULL_CERT_CONFIG_DIR:-/etc/pull-cert}
+
+DRY_RUN=0
+FORCE=0
+VERBOSE=0
+
+# --------------------------------------------------------------------------
+# Output helpers. Everything goes to stderr so stdout stays clean.
+# --------------------------------------------------------------------------
+
+log()  { echo "$PROGNAME: $*" >&2; logger -t "$PROGNAME" -- "$*" 2>/dev/null || true; }
+warn() { echo "$PROGNAME: warning: $*" >&2; logger -t "$PROGNAME" -p user.warning -- "$*" 2>/dev/null || true; }
+die()  { echo "$PROGNAME: error: $*" >&2; logger -t "$PROGNAME" -p user.err -- "$*" 2>/dev/null || true; exit 1; }
+dbg()  { [ "$VERBOSE" -eq 1 ] && echo "$PROGNAME: $*" >&2 || true; }
+
+usage() {
+    cat <<EOF
+Usage: $PROGNAME <profile> [options]
+
+Fetches a certificate from a central ACME host and installs it locally.
+
+Options:
+  --dry-run     Fetch and validate, but do not install or reload.
+  --force       Install and reload even if the certificate is unchanged.
+  --verbose     Print what is happening at each step.
+  -h, --help    Show this message.
+
+Profiles are read from $CONFIG_DIR/<profile>.conf
+EOF
+}
+
+# --------------------------------------------------------------------------
+# Argument parsing
+# --------------------------------------------------------------------------
+
+PROFILE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1 ;;
+        --force)   FORCE=1 ;;
+        --verbose) VERBOSE=1 ;;
+        -h|--help) usage; exit 0 ;;
+        -*)        die "unknown option: $1" ;;
+        *)
+            [ -n "$PROFILE" ] && die "more than one profile given"
+            PROFILE="$1"
+            ;;
+    esac
+    shift
+done
+
+[ -n "$PROFILE" ] || { usage >&2; exit 2; }
+
+case "$PROFILE" in
+    *[!a-zA-Z0-9._-]*) die "invalid profile name: $PROFILE" ;;
+esac
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+CONFIG="$CONFIG_DIR/$PROFILE.conf"
+[ -r "$CONFIG" ] || die "cannot read $CONFIG"
+
+# The config is sourced and its hooks are executed, so a writable config is
+# equivalent to root on this machine.
+if [ -n "$(find "$CONFIG" -perm /022 -print -quit 2>/dev/null)" ]; then
+    die "$CONFIG is group- or world-writable, refusing to source it"
+fi
+
+# Defaults, overridable by the profile.
+REMOTE_USER="acme"
+REMOTE_PORT="22"
+SSH_KEY=""
+SSH_OPTIONS=""
+FULLCHAIN_DEST=""
+KEY_DEST=""
+FULLCHAIN_MODE="0644"
+KEY_MODE="0600"
+OWNER="root:root"
+KEY_OWNER=""
+TEST_CMD=""
+RELOAD_CMD=""
+CONNECT_TIMEOUT="15"
+MAX_ARCHIVE_BYTES="262144"
+EXPECT_DOMAIN=""
+
+# shellcheck source=/dev/null
+. "$CONFIG"
+
+[ -n "${REMOTE_HOST:-}" ]   || die "REMOTE_HOST is not set in $CONFIG"
+[ -n "$FULLCHAIN_DEST" ]    || die "FULLCHAIN_DEST is not set in $CONFIG"
+[ -n "$KEY_DEST" ]          || die "KEY_DEST is not set in $CONFIG"
+[ -n "$KEY_OWNER" ]         || KEY_OWNER="$OWNER"
+
+dbg "profile $PROFILE, remote $REMOTE_USER@$REMOTE_HOST:$REMOTE_PORT"
+
+# --------------------------------------------------------------------------
+# Fetch
+# --------------------------------------------------------------------------
+
+TMPDIR_WORK=$(mktemp -d)
+cleanup() { rm -rf "$TMPDIR_WORK"; }
+trap cleanup EXIT
+
+ssh_args=(
+    -o BatchMode=yes
+    -o ConnectTimeout="$CONNECT_TIMEOUT"
+    -p "$REMOTE_PORT"
+)
+[ -n "$SSH_KEY" ] && ssh_args+=(-i "$SSH_KEY" -o IdentitiesOnly=yes)
+# shellcheck disable=SC2206
+[ -n "$SSH_OPTIONS" ] && ssh_args+=($SSH_OPTIONS)
+
+dbg "fetching archive"
+
+# Cap what the remote side can make us store. A certificate bundle is a few
+# kilobytes; anything larger is a mistake or an attempt to fill the disk.
+# head stops reading at the limit, so an endless stream costs us nothing.
+set +o pipefail
+ssh "${ssh_args[@]}" "$REMOTE_USER@$REMOTE_HOST" \
+    | head -c "$MAX_ARCHIVE_BYTES" > "$TMPDIR_WORK/certs.tar"
+ssh_status=${PIPESTATUS[0]}
+set -o pipefail
+
+archive_size=$(wc -c < "$TMPDIR_WORK/certs.tar")
+
+# Check the size first: when head cuts the stream short, ssh dies of SIGPIPE
+# and its exit status would otherwise mask the real reason.
+if [ "$archive_size" -ge "$MAX_ARCHIVE_BYTES" ]; then
+    die "remote sent more than MAX_ARCHIVE_BYTES ($MAX_ARCHIVE_BYTES), refusing"
+fi
+[ "$ssh_status" -eq 0 ] || die "ssh to $REMOTE_HOST failed (status $ssh_status)"
+[ "$archive_size" -gt 0 ] || die "remote returned an empty archive"
+dbg "received $archive_size bytes"
+
+mkdir "$TMPDIR_WORK/new"
+NEW_CERT="$TMPDIR_WORK/new/fullchain.pem"
+NEW_KEY="$TMPDIR_WORK/new/privkey.pem"
+
+# Extract to stdout by name rather than unpacking the archive. tar never
+# creates a filesystem entry, so symlinks, hardlinks, device nodes, setuid
+# bits and path traversal in the archive cannot affect us at all. This also
+# removes the dependency on the local tar implementing those protections.
+extract_member() {
+    local member=$1 dest=$2
+    tar -xOf "$TMPDIR_WORK/certs.tar" "$member" > "$dest" 2>/dev/null \
+        || die "archive contains no $member"
+    [ -s "$dest" ] || die "$member in archive is empty"
+}
+
+extract_member fullchain.pem "$NEW_CERT"
+extract_member privkey.pem "$NEW_KEY"
+
+# --------------------------------------------------------------------------
+# Validate before touching anything on disk
+# --------------------------------------------------------------------------
+
+openssl x509 -in "$NEW_CERT" -noout >/dev/null 2>&1 \
+    || die "fetched certificate is not valid PEM"
+openssl pkey -in "$NEW_KEY" -noout >/dev/null 2>&1 \
+    || die "fetched private key is not valid PEM"
+
+# Works for both RSA and EC, unlike the classic modulus comparison.
+cert_pub=$(openssl x509 -in "$NEW_CERT" -pubkey -noout 2>/dev/null)
+key_pub=$(openssl pkey -in "$NEW_KEY" -pubout 2>/dev/null)
+[ "$cert_pub" = "$key_pub" ] || die "certificate and private key do not match"
+
+if ! openssl x509 -in "$NEW_CERT" -checkend 0 -noout >/dev/null 2>&1; then
+    die "fetched certificate has already expired"
+fi
+
+if ! openssl x509 -in "$NEW_CERT" -checkend 604800 -noout >/dev/null 2>&1; then
+    warn "fetched certificate expires within 7 days - is renewal working on $REMOTE_HOST?"
+fi
+
+# Optional: refuse a certificate that is valid but for the wrong name. Catches
+# a mixed-up authorized_keys entry as well as a substituted certificate.
+if [ -n "$EXPECT_DOMAIN" ]; then
+    names=$(openssl x509 -in "$NEW_CERT" -noout -ext subjectAltName 2>/dev/null \
+            | tr ',' '\n' | sed -n 's/.*DNS://p' | tr -d ' ')
+    matched=0
+    for n in $names; do
+        [ "$n" = "$EXPECT_DOMAIN" ] && { matched=1; break; }
+        case "$n" in
+            "*."*) [ "${EXPECT_DOMAIN#*.}" = "${n#*.}" ] \
+                   && [ "${EXPECT_DOMAIN%%.*}" != "$EXPECT_DOMAIN" ] \
+                   && { matched=1; break; } ;;
+        esac
+    done
+    [ "$matched" -eq 1 ] || die "certificate does not cover $EXPECT_DOMAIN"
+    dbg "certificate covers $EXPECT_DOMAIN"
+fi
+
+subject=$(openssl x509 -in "$NEW_CERT" -noout -subject 2>/dev/null || true)
+enddate=$(openssl x509 -in "$NEW_CERT" -noout -enddate 2>/dev/null || true)
+dbg "fetched ${subject#subject=}, ${enddate#notAfter=}"
+
+# --------------------------------------------------------------------------
+# Decide whether anything needs doing
+# --------------------------------------------------------------------------
+
+if [ "$FORCE" -eq 0 ] \
+   && cmp -s "$NEW_CERT" "$FULLCHAIN_DEST" 2>/dev/null \
+   && cmp -s "$NEW_KEY" "$KEY_DEST" 2>/dev/null; then
+    dbg "certificate unchanged, nothing to do"
+    exit 0
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    log "dry run: would install ${enddate#notAfter=} certificate for $PROFILE"
+    exit 0
+fi
+
+# --------------------------------------------------------------------------
+# Install, with rollback if the service rejects the new files
+# --------------------------------------------------------------------------
+
+install -d -m 0755 "$(dirname "$FULLCHAIN_DEST")"
+install -d -m 0755 "$(dirname "$KEY_DEST")"
+
+BACKUP="$TMPDIR_WORK/backup"
+mkdir "$BACKUP"
+had_backup=0
+if [ -f "$FULLCHAIN_DEST" ] && [ -f "$KEY_DEST" ]; then
+    cp -p "$FULLCHAIN_DEST" "$BACKUP/fullchain.pem"
+    cp -p "$KEY_DEST" "$BACKUP/privkey.pem"
+    had_backup=1
+fi
+
+rollback() {
+    if [ "$had_backup" -eq 1 ]; then
+        warn "rolling back to previous certificate"
+        cp -p "$BACKUP/fullchain.pem" "$FULLCHAIN_DEST"
+        cp -p "$BACKUP/privkey.pem" "$KEY_DEST"
+    else
+        warn "no previous certificate to roll back to"
+    fi
+}
+
+# Write to a temporary name in the target directory, then rename. A reader
+# opening the file mid-update sees either the old or the new one, never half.
+install_atomic() {
+    local src=$1 dest=$2 mode=$3 owner=$4
+    local tmp="$dest.pull-cert.$$"
+    install -m "$mode" -o "${owner%%:*}" -g "${owner##*:}" "$src" "$tmp" \
+        || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$dest"
+}
+
+install_atomic "$NEW_KEY" "$KEY_DEST" "$KEY_MODE" "$KEY_OWNER" \
+    || die "could not install private key to $KEY_DEST"
+install_atomic "$NEW_CERT" "$FULLCHAIN_DEST" "$FULLCHAIN_MODE" "$OWNER" \
+    || { rollback; die "could not install certificate to $FULLCHAIN_DEST"; }
+
+if [ -n "$TEST_CMD" ]; then
+    dbg "running test command"
+    if ! eval "$TEST_CMD" >/dev/null 2>&1; then
+        rollback
+        die "test command failed, certificate not applied: $TEST_CMD"
+    fi
+fi
+
+if [ -n "$RELOAD_CMD" ]; then
+    dbg "running reload command"
+    if ! eval "$RELOAD_CMD"; then
+        die "certificate installed but reload failed: $RELOAD_CMD"
+    fi
+fi
+
+log "installed new certificate for $PROFILE (valid until ${enddate#notAfter=})"
