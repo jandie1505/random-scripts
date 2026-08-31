@@ -1,0 +1,14 @@
+[Unit]
+Description=Hourly certificate sync for %I
+
+[Timer]
+OnCalendar=hourly
+# Spread the load so every host does not hit the ACME server at :00.
+RandomizedDelaySec=30m
+# Catch up after downtime instead of waiting for the next full hour.
+Persistent=true
+# Do not run with a stale certificate right after a reboot.
+OnBootSec=2min
+
+[Install]
+WantedBy=timers.target
