@@ -77,11 +77,23 @@ esac
 CONFIG="$CONFIG_DIR/$PROFILE.conf"
 [ -r "$CONFIG" ] || die "cannot read $CONFIG"
 
-# The config is sourced and its hooks are executed, so a writable config is
-# equivalent to root on this machine.
-if [ -n "$(find "$CONFIG" -perm /022 -print -quit 2>/dev/null)" ]; then
-    die "$CONFIG is group- or world-writable, refusing to source it"
-fi
+# The config is sourced and TEST_CMD/RELOAD_CMD run with our privileges, so
+# anyone who can rewrite the file - or replace it by writing in its directory -
+# effectively owns this machine. Both are checked, not just the file's mode.
+require_secure() {
+    local path=$1 kind=$2 owner mode
+    owner=$(stat -c '%u' "$path" 2>/dev/null) || die "cannot stat $path"
+    mode=$(stat -c '%a' "$path" 2>/dev/null)
+    if [ "$owner" -ne 0 ] && [ "$owner" -ne "$(id -u)" ]; then
+        die "$kind $path is owned by uid $owner, expected root or uid $(id -u)"
+    fi
+    if [ -n "$(find "$path" -maxdepth 0 -perm /022 -print -quit 2>/dev/null)" ]; then
+        die "$kind $path is group- or world-writable (mode $mode)"
+    fi
+}
+
+require_secure "$CONFIG_DIR" "config directory"
+require_secure "$CONFIG" "config file"
 
 # Defaults, overridable by the profile.
 REMOTE_USER="acme"
