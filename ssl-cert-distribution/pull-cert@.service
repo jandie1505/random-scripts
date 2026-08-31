@@ -1,0 +1,14 @@
+[Unit]
+Description=Pull TLS certificate for %I from the ACME host
+Documentation=https://github.com/jandie1505/random-scripts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pull-cert %i
+SyslogIdentifier=pull-cert
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
