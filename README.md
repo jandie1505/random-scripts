@@ -21,3 +21,23 @@ Plays a specified sound on the GoXLR's sampler channel.
 
 Requirements: `pw-play`  
 It might be necessary to change the sink name (`SINK="..."`).
+
+## SSL Certificate Distribution
+Scripts for serving and pulling SSL certificates from a central server via SSH.
+
+```
+  ACME host                            target machine
+  ---------                            --------------
+  acme.sh --cron                       pull-cert.timer (hourly)
+    |                                    |
+    v                                    v
+  /srv/certs/<target>/                 ssh -> serve-cert <target>
+    fullchain.pem                        |
+    privkey.pem                          v
+    ^                                  validate, compare, install
+    |                                    |
+  sshd + forced command                  v
+  serve-cert <target>  <---------------  reload service
+```
+
+[Click here for more information](ssl-cert-distribution/README.md)
